@@ -1,0 +1,398 @@
+
+# -------------------------------------------------------------------------------------------------
+#
+# Time series network monitoring and visualization for AWS PrivateLink using Amazon CloudWatch Contributor Insights
+# ---Provisions CloudWatch Contributor Insights Rules for time series analysis of network bytes transferred,
+#       active/rejected connections and top 10 contributors
+# ---Provisions CloudWatch Metrics based on Contributor Insights rules
+# ---Provisions CloudWatch dashboard for visualizing time series analysis based on Contributor Insights rules
+# 
+# 
+# @kmmahaj
+# ---------------------------------------------------------------------------------------------------
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: PrivateLink network transfer visualizations using CloudWatch Contributor Insights
+
+Parameters:
+
+  ContributorInsightRuleState:
+      Type: String
+      Description: Select to enable or disable the Contributor Insight Rules on Creation.
+      Default: ENABLED
+      AllowedValues:
+        - ENABLED
+        - DISABLED
+
+  CloudWatchLogGroupFlowLogsConsumerVPC:
+    Description: REQUIRED. Name of the CloudWatch Log group configured for "Consumer side" VPC Flow Logs. Contains the VPC Endpoint
+    Type: String
+    Default: 'NP1VPC-CloudWatchLogGroup-us-east-1'
+    ConstraintDescription: Required
+
+  NetworkInterfaceVPCEndpoint:
+    Description: REQUIRED. ENI identifier(eni-xxxx) for the VPC endpoint. Used by the “Consumer side” of the PrivateLink. 1 per Az.
+    Type: String
+    Default: eni-01234123412341234
+    ConstraintDescription: Required (either Az1 or Az2 or Az3)
+
+  CloudWatchLogGroupFlowLogsProducerVPC:
+    Description: OPTIONAL. Name of the CloudWatch Log group configured for "Producer side" VPC Flow Logs. Contains the NLB (or Gateway LB)
+    Type: String
+    Default: 'NP2VPC-CloudWatchLogGroup-us-east-1'
+    ConstraintDescription: Optional
+
+  NetworkInterfaceNLBProducer:
+    Description: OPTIONAL. ENI identifier(eni-xxxx) for the NLB (or Gateway LB). Used by the “Producer side” of the PrivateLink. 1 per Az.
+    Type: String
+    Default: eni-01234123412341234
+    ConstraintDescription: Optional (either Az1 or Az2 or Az3)) 
+
+  EmailAddress:
+    Description: Email Address for notifications
+    Type: String
+    Default: admin@yourdomain.com
+
+  TopicName:
+    Description: SNS Topic Name
+    Type: String
+    Default: NetworkSNS
+
+Outputs:
+  OutputDashboardURI:
+    Description: Link to the CloudWatch Dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${PrivateLinkContributorInsights}'
+
+Conditions:
+
+  CreateVPCEndpointConsumerRule: !Not 
+    - !Equals 
+      - !Ref NetworkInterfaceVPCEndpoint
+      - 'eni-01234123412341234'
+  
+
+  CreateNLBProducerRule: !Not 
+    - !Equals 
+      - !Ref NetworkInterfaceNLBProducer
+      - 'eni-01234123412341234'
+  
+
+  CreateDashboardRule: !Or 
+    - !Condition CreateVPCEndpointConsumerRule
+    - !Condition CreateNLBProducerRule
+
+
+Resources:
+
+# SNS topic for CloudWatch Alarm Notifications
+  AlarmNotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: !Ref TopicName
+      TopicName: !Ref TopicName
+
+# Email Subscription for SNS topic
+  AlarmEmailSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: email
+      Endpoint: !Ref EmailAddress
+      TopicArn: !Ref AlarmNotificationTopic
+
+
+#===============================================================================================================================
+# Consumer side VPC Interface Endpoint network monitoring (Az1/Az2/Az3) -  Bytes transferred rule 
+# (Sum of bytes transferred via the Consumer endpoint from a source ip to a destination ip) 
+#===============================================================================================================================
+
+  VPCEndpointConsumerBytesRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "Schema": {
+                "Name": "CloudWatchLogRule",
+                "Version": 1
+            },
+            "LogGroupNames": [
+                "${CloudWatchLogGroupFlowLogsConsumerVPC}"
+            ],
+            "LogFormat": "CLF",
+            "Fields": {
+                "4": "srcaddr",
+                "5": "dstaddr",
+                "3": "interface_id",
+                "10": "bytes"
+            },
+            "Contribution": {
+                "Filters": [
+                    {
+                        "In": [
+                            "${NetworkInterfaceVPCEndpoint}"
+                        ],
+                        "Match": "interface_id"
+                    }
+                ],                  
+                "Keys": [
+                    "srcaddr",
+                    "dstaddr"
+                ],
+                "ValueOf": "bytes"
+            },
+            "AggregateOn": "Sum"
+        }
+      RuleName: VPCEndpointConsumerBytesRule
+      RuleState: !Ref ContributorInsightRuleState    
+
+
+#===============================================================================================================================
+#  - Monitors source ip addresses from the Consumer Endpoint that made connection requests
+# (Top contributors for establishing connections by source IP  - i.e which source IPs from the Consumer Endpoint initiated the most TCP connections.)
+#===============================================================================================================================
+
+  PrivateLinkConnectionsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "Schema": {
+                "Name": "CloudWatchLogRule",
+                "Version": 1
+            },
+            "LogGroupNames": [
+                "${CloudWatchLogGroupFlowLogsConsumerVPC}"
+            ],
+            "LogFormat": "CLF",
+            "Fields": {
+                "4": "srcaddr",
+                "5": "dstaddr",
+                "3": "interface_id",
+                "8": "protocol",
+                "10": "bytes",
+                "23": "tcp-flag",
+                "13": "action"
+            },
+            "Contribution": {
+                "Filters": [
+                    {
+                        "In": [
+                            "${NetworkInterfaceVPCEndpoint}"
+                        ],
+                        "Match": "interface_id"
+                    },
+                    {
+                        "Match": "protocol",
+                        "EqualTo": 6
+                    }     
+                ],                  
+                "Keys": [
+                    "interface_id",
+                    "srcaddr"
+                ]
+            },
+            "AggregateOn": "Sum"
+        }
+      RuleName: PrivateLinkConnectionsRule
+      RuleState: !Ref ContributorInsightRuleState    
+
+#===============================================================================================================================
+#  - Monitors source ip addresses from the Consumer Endpoint whose connection requests were rejected
+# ( Top-N contributors by Source IP address and port where the action was rejected. )
+#===============================================================================================================================
+
+  PrivateLinkRejectConnectionsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "Schema": {
+                "Name": "CloudWatchLogRule",
+                "Version": 1
+            },
+            "LogGroupNames": [
+                "${CloudWatchLogGroupFlowLogsConsumerVPC}"
+            ],
+            "LogFormat": "CLF",
+            "Fields": {
+                "4": "srcaddr",
+                "5": "dstaddr",
+                "3": "interface_id",
+                "7": "dstport",
+                "8": "protocol",
+                "10": "bytes",
+                "13": "action"
+            },
+            "Contribution": {
+                "Filters": [
+                    {
+                        "In": [
+                            "${NetworkInterfaceVPCEndpoint}"
+                        ],
+                        "Match": "interface_id"
+                    },
+                    {
+                        "In": [
+                            "REJECT"
+                        ],
+                        "Match": "action"
+                    }
+                ],                  
+                "Keys": [
+                    "interface_id",
+                    "srcaddr"
+                ]
+            },
+            "AggregateOn": "Sum"
+        }
+      RuleName: PrivateLinkRejectConnectionsRule
+      RuleState: !Ref ContributorInsightRuleState    
+
+#====================================================================================================================
+# CloudWatch Metrics and CloudWatch Alarms based on PrivateLink CloudWatch Contributor Insights Rule
+#====================================================================================================================
+
+  PrivateLinkBytesTransferAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn: VPCEndpointConsumerBytesRule
+    Properties:
+      EvaluationPeriods: '1'
+      AlarmDescription: Alarms when there is a high bytes transfer - >10K bytes in a 5 min period
+      AlarmName: 'PrivateLinkHighBytesTransferAlarm'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 10000
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      Metrics: 
+        - Expression: INSIGHT_RULE_METRIC("VPCEndpointConsumerBytesRule", "Sum")
+          Id: m1
+          Period: 600
+          Label: High_Bytes_Transfer
+          ReturnData: True
+        
+#====================================================================================================================
+# CloudWatch Metrics and CloudWatch Alarms based on PrivateLink CloudWatch Contributor Insights Rule
+#====================================================================================================================
+
+  PrivateLinkRejectConnectionsAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn: PrivateLinkRejectConnectionsRule
+    Properties:
+      EvaluationPeriods: '1'
+      AlarmDescription: Alarms when there are > 3 source ips with rejected connections in a 1 min period
+      AlarmName: 'PrivateLinkRejectConnectionsAlarm'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 3
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      Metrics: 
+        - Expression: INSIGHT_RULE_METRIC("PrivateLinkRejectConnectionsRule", "Sum")
+          Id: m2
+          Period: 60
+          Label: High_Reject_Connections
+          ReturnData: True
+                
+
+#====================================================================================================================
+# Centralized CloudWatch Dashboard
+#====================================================================================================================
+  PrivateLinkContributorInsights:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboardRule
+    Properties:
+      DashboardBody: !Sub |
+        {
+            "widgets": [
+                {
+                    "type": "metric",
+                    "x": 0,
+                    "y": 12,
+                    "width": 12,
+                    "height": 6,
+                    "properties": {
+                        "period": 60,
+                        "insightRule": {
+                            "maxContributorCount": 50,
+                            "orderBy": "Sum",
+                            "ruleName": "${VPCEndpointConsumerBytesRule.RuleName}"
+                        },
+                        "stacked": false,
+                        "view": "timeSeries",
+                        "yAxis": {
+                            "left": {
+                                "showUnits": false
+                            },
+                            "right": {
+                                "showUnits": false
+                            }
+                        },
+                          "region": "${AWS::Region}",
+                        "title": "PrivateLink - Bytes Transferred",
+                        "legend": {
+                            "position": "right"
+                        }
+                    }
+                },
+                {
+                    "type": "metric",
+                    "x": 0,
+                    "y": 12,
+                    "width": 12,
+                    "height": 6,
+                    "properties": {
+                        "period": 60,
+                        "insightRule": {
+                            "maxContributorCount": 50,
+                            "orderBy": "Sum",
+                            "ruleName": "${PrivateLinkConnectionsRule.RuleName}"
+                        },
+                        "stacked": false,
+                        "view": "timeSeries",
+                        "yAxis": {
+                            "left": {
+                                "showUnits": false
+                            },
+                            "right": {
+                                "showUnits": false
+                            }
+                        },
+                          "region": "${AWS::Region}",
+                        "title": "PrivateLink - Total Connections",
+                        "legend": {
+                            "position": "right"
+                        }
+                    }
+                },
+                {
+                    "type": "metric",
+                    "x": 0,
+                    "y": 12,
+                    "width": 12,
+                    "height": 6,
+                    "properties": {
+                        "period": 60,
+                        "insightRule": {
+                            "maxContributorCount": 50,
+                            "orderBy": "Sum",
+                            "ruleName": "${PrivateLinkRejectConnectionsRule.RuleName}"
+                        },
+                        "stacked": false,
+                        "view": "timeSeries",
+                        "yAxis": {
+                            "left": {
+                                "showUnits": false
+                            },
+                            "right": {
+                                "showUnits": false
+                            }
+                        },
+                          "region": "${AWS::Region}",
+                        "title": "PrivateLink - Rejected Connections",
+                        "legend": {
+                            "position": "right"
+                        }
+                    }
+                }
+            ]
+         }
+      DashboardName: PrivateLinkContributorInsights
+      
